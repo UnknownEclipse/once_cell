@@ -817,7 +817,7 @@ pub mod unsync {
 }
 
 /// Thread-safe, blocking version of `OnceCell`.
-#[cfg(any(feature = "std", feature = "critical-section"))]
+#[cfg(feature = "sync")]
 pub mod sync {
     use core::{
         cell::Cell,
