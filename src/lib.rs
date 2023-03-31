@@ -337,17 +337,7 @@
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
-
-#[cfg(all(feature = "critical-section", not(feature = "std")))]
-#[path = "imp_cs.rs"]
-mod imp;
-
-#[cfg(all(feature = "std", feature = "parking_lot"))]
-#[path = "imp_pl.rs"]
-mod imp;
-
-#[cfg(all(feature = "std", not(feature = "parking_lot")))]
-#[path = "imp_std.rs"]
+#[cfg(feature = "sync")]
 mod imp;
 
 /// Single-threaded version of `OnceCell`.

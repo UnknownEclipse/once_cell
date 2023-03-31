@@ -1,17 +1,17 @@
-use std::{
+use core::{
     cell::UnsafeCell,
     panic::{RefUnwindSafe, UnwindSafe},
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 pub(crate) struct OnceCell<T> {
-    state: AtomicU8,
+    state: AtomicU32,
     value: UnsafeCell<Option<T>>,
 }
 
-const INCOMPLETE: u8 = 0x0;
-const RUNNING: u8 = 0x1;
-const COMPLETE: u8 = 0x2;
+const INCOMPLETE: u32 = 0x0;
+const RUNNING: u32 = 0x1;
+const COMPLETE: u32 = 0x2;
 
 // Why do we need `T: Send`?
 // Thread A creates a `OnceCell` and shares it with
@@ -26,11 +26,11 @@ impl<T: UnwindSafe> UnwindSafe for OnceCell<T> {}
 
 impl<T> OnceCell<T> {
     pub(crate) const fn new() -> OnceCell<T> {
-        OnceCell { state: AtomicU8::new(INCOMPLETE), value: UnsafeCell::new(None) }
+        OnceCell { state: AtomicU32::new(INCOMPLETE), value: UnsafeCell::new(None) }
     }
 
     pub(crate) const fn with_value(value: T) -> OnceCell<T> {
-        OnceCell { state: AtomicU8::new(COMPLETE), value: UnsafeCell::new(Some(value)) }
+        OnceCell { state: AtomicU32::new(COMPLETE), value: UnsafeCell::new(Some(value)) }
     }
 
     /// Safety: synchronizes with store to value via Release/Acquire.
@@ -78,16 +78,12 @@ impl<T> OnceCell<T> {
 
     #[cold]
     pub(crate) fn wait(&self) {
-        let key = &self.state as *const _ as usize;
-        unsafe {
-            parking_lot_core::park(
-                key,
-                || self.state.load(Ordering::Acquire) != COMPLETE,
-                || (),
-                |_, _| (),
-                parking_lot_core::DEFAULT_PARK_TOKEN,
-                None,
-            );
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state == COMPLETE {
+                return;
+            }
+            custom_wait(&self.state, state);
         }
     }
 
@@ -120,23 +116,20 @@ impl<T> OnceCell<T> {
 }
 
 struct Guard<'a> {
-    state: &'a AtomicU8,
-    new_state: u8,
+    state: &'a AtomicU32,
+    new_state: u32,
 }
 
 impl<'a> Drop for Guard<'a> {
     fn drop(&mut self) {
         self.state.store(self.new_state, Ordering::Release);
-        unsafe {
-            let key = self.state as *const AtomicU8 as usize;
-            parking_lot_core::unpark_all(key, parking_lot_core::DEFAULT_UNPARK_TOKEN);
-        }
+        custom_notify(self.state);
     }
 }
 
 // Note: this is intentionally monomorphic
 #[inline(never)]
-fn initialize_inner(state: &AtomicU8, init: &mut dyn FnMut() -> bool) {
+fn initialize_inner(state: &AtomicU32, init: &mut dyn FnMut() -> bool) {
     loop {
         let exchange =
             state.compare_exchange_weak(INCOMPLETE, RUNNING, Ordering::Acquire, Ordering::Acquire);
@@ -149,26 +142,57 @@ fn initialize_inner(state: &AtomicU8, init: &mut dyn FnMut() -> bool) {
                 return;
             }
             Err(COMPLETE) => return,
-            Err(RUNNING) => unsafe {
-                let key = state as *const AtomicU8 as usize;
-                parking_lot_core::park(
-                    key,
-                    || state.load(Ordering::Relaxed) == RUNNING,
-                    || (),
-                    |_, _| (),
-                    parking_lot_core::DEFAULT_PARK_TOKEN,
-                    None,
-                );
-            },
+            Err(RUNNING) => custom_wait(state, RUNNING),
             Err(INCOMPLETE) => (),
             Err(_) => debug_assert!(false),
         }
     }
 }
 
-#[test]
-fn test_size() {
-    use std::mem::size_of;
+fn custom_wait(atomic: &AtomicU32, value: u32) {
+    unsafe { __once_cell_wait(atomic, value) };
+}
 
-    assert_eq!(size_of::<OnceCell<bool>>(), 1 * size_of::<bool>() + size_of::<u8>());
+fn custom_notify(atomic: &AtomicU32) {
+    unsafe { __once_cell_notify(atomic) };
+}
+
+extern "C" {
+    fn __once_cell_wait(atomic: *const AtomicU32, value: u32);
+    fn __once_cell_notify(atomic: *const AtomicU32);
+}
+
+#[cfg(feature = "spin")]
+mod atomic_imp {
+    use core::{
+        hint,
+        sync::atomic::{AtomicU32, Ordering},
+    };
+
+    #[no_mangle]
+    pub extern "C" fn __once_cell_wait(atomic: &AtomicU32, value: u32) {
+        while atomic.load(Ordering::Acquire) == value {
+            hint::spin_loop();
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn __once_cell_notify(_atomic: *const AtomicU32) {}
+}
+
+#[cfg(feature = "atomic-wait")]
+mod atomic_imp {
+    use core::sync::atomic::AtomicU32;
+
+    use atomic_wait::{wait, wake_all};
+
+    #[no_mangle]
+    pub extern "C" fn __once_cell_wait(atomic: &AtomicU32, value: u32) {
+        wait(atomic, value);
+    }
+
+    #[no_mangle]
+    pub extern "C" fn __once_cell_notify(atomic: *const AtomicU32) {
+        wake_all(atomic);
+    }
 }
